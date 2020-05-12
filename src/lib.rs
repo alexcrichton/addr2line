@@ -256,22 +256,6 @@ impl<R: gimli::Reader> Context<R> {
 
         unit_ranges.sort_by_key(|x| x.0.begin);
 
-        // Ranges need to be disjoint so that we can binary search, but weak symbols can
-        // cause overlap. In this case, we don't care which unit is used, so ignore the
-        // beginning of the subseqent range to avoid overlap.
-        let mut prev_end = 0;
-        for range in &mut unit_ranges {
-            if range.0.begin < prev_end {
-                range.0.begin = prev_end;
-            }
-            if range.0.end < prev_end {
-                range.0.end = prev_end;
-            } else {
-                prev_end = range.0.end;
-            }
-        }
-        debug_assert!(unit_ranges.windows(2).all(|w| w[0].0.end <= w[1].0.begin));
-
         Ok(Context {
             units: res_units,
             unit_ranges,
@@ -284,35 +268,41 @@ impl<R: gimli::Reader> Context<R> {
         &self.sections
     }
 
-    fn find_unit_id(&self, probe: u64) -> Option<usize> {
-        let idx = self.unit_ranges.binary_search_by(|r| {
-            if probe < r.0.begin {
-                Ordering::Greater
-            } else if probe >= r.0.end {
-                Ordering::Less
-            } else {
-                Ordering::Equal
-            }
-        });
-        let idx = match idx {
-            Ok(x) => x,
-            Err(_) => return None,
+    fn find_unit_id_and_function_idx(&self, probe: u64) -> Option<(usize, usize)> {
+        let pos = match self.unit_ranges.binary_search_by_key(&probe, |r| r.0.begin) {
+            Ok(i) => i,
+            Err(i) => i.checked_sub(1)?,
         };
 
-        let (_, unit_id) = self.unit_ranges[idx];
-        Some(unit_id)
+        for (range, unit_id) in self.unit_ranges[pos..].iter() {
+            if probe < range.begin {
+                return None;
+            }
+            if probe > range.end {
+                continue;
+            }
+            let funcs = match self.units[*unit_id].parse_functions(&self.sections, &self.units) {
+                Ok(func) => func,
+                Err(_) => continue,
+            };
+            if let Some(addr) = funcs.find_address(probe) {
+                return Some((*unit_id, addr));
+            }
+        }
+
+        None
     }
 
     /// Find the DWARF unit corresponding to the given virtual memory address.
     pub fn find_dwarf_unit(&self, probe: u64) -> Option<&gimli::Unit<R>> {
-        self.find_unit_id(probe)
-            .map(|unit_id| &self.units[unit_id].dw_unit)
+        self.find_unit_id_and_function_idx(probe)
+            .map(|(unit_id, _)| &self.units[unit_id].dw_unit)
     }
 
     /// Find the source file and line corresponding to the given virtual memory address.
     pub fn find_location(&self, probe: u64) -> Result<Option<Location<'_>>, Error> {
-        match self.find_unit_id(probe) {
-            Some(unit_id) => self.units[unit_id].find_location(probe, &self.sections),
+        match self.find_unit_id_and_function_idx(probe) {
+            Some((unit_id, _)) => self.units[unit_id].find_location(probe, &self.sections),
             None => Ok(None),
         }
     }
@@ -327,21 +317,13 @@ impl<R: gimli::Reader> Context<R> {
     /// to the innermost inline function.  Subsequent frames contain the caller and call
     /// location, until an non-inline caller is reached.
     pub fn find_frames(&self, probe: u64) -> Result<FrameIter<R>, Error> {
-        let (unit_id, loc, funcs) = match self.find_unit_id(probe) {
-            Some(unit_id) => {
-                let unit = &self.units[unit_id];
-                let loc = unit.find_location(probe, &self.sections)?;
-                let functions = unit.parse_functions(&self.sections, &self.units)?;
-                let mut res = maybe_small::Vec::new();
-                if let Ok(address) = functions.addresses.binary_search_by(|address| {
-                    if probe < address.range.begin {
-                        Ordering::Greater
-                    } else if probe >= address.range.end {
-                        Ordering::Less
-                    } else {
-                        Ordering::Equal
-                    }
-                }) {
+        let (unit_id, loc, funcs) =
+            match self.find_unit_id_and_function_idx(probe) {
+                Some((unit_id, address)) => {
+                    let unit = &self.units[unit_id];
+                    let loc = unit.find_location(probe, &self.sections)?;
+                    let functions = unit.parse_functions(&self.sections, &self.units)?;
+                    let mut res = maybe_small::Vec::new();
                     let mut function_index = functions.addresses[address].function;
                     loop {
                         let function = &functions.functions[function_index];
@@ -355,11 +337,10 @@ impl<R: gimli::Reader> Context<R> {
                             break;
                         }
                     }
+                    (unit_id, loc, res)
                 }
-                (unit_id, loc, res)
-            }
-            None => (0, None, maybe_small::Vec::new()),
-        };
+                None => (0, None, maybe_small::Vec::new()),
+            };
 
         Ok(FrameIter {
             unit_id,
@@ -747,6 +728,20 @@ impl<R: gimli::Reader> Functions<R> {
             functions: functions.into_boxed_slice(),
             addresses: addresses.into_boxed_slice(),
         })
+    }
+
+    fn find_address(&self, probe: u64) -> Option<usize> {
+        self.addresses
+            .binary_search_by(|address| {
+                if probe < address.range.begin {
+                    Ordering::Greater
+                } else if probe >= address.range.end {
+                    Ordering::Less
+                } else {
+                    Ordering::Equal
+                }
+            })
+            .ok()
     }
 }
 
